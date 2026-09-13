@@ -4,27 +4,21 @@ import threading
 import requests
 from flask import Flask
 
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Goal Plus Live is running"
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+# =========================
+# CONFIGURATION
+# =========================
 
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@goalplus01")
 
+API_BASE = "https://v3.football.api-sports.io"
+
 HEADERS = {
     "x-apisports-key": API_KEY
 }
 
-LIVE_URL = "https://v3.football.api-sports.io/fixtures?live=all"
-
-# Grandes compétitions uniquement
+# Grandes compétitions
 COMPETITIONS = {
     ("Premier League", "England"),
     ("La Liga", "Spain"),
@@ -38,8 +32,41 @@ COMPETITIONS = {
 seen_events = set()
 seen_status = set()
 
+# =========================
+# SERVEUR WEB POUR RENDER
+# =========================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Goal Plus Live is running"
+
+
+@app.route("/health")
+def health():
+    return "OK"
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
+
+
+# =========================
+# TELEGRAM
+# =========================
 
 def send_telegram(message):
+    if not BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN manquant.")
+        return False
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     response = requests.post(
@@ -51,121 +78,195 @@ def send_telegram(message):
         timeout=20
     )
 
+    if not response.ok:
+        print("❌ Erreur Telegram :", response.text)
+
     return response.ok
 
 
+# =========================
+# API-FOOTBALL
+# =========================
+
 def get_live_matches():
     response = requests.get(
-        LIVE_URL,
+        f"{API_BASE}/fixtures?live=all",
         headers=HEADERS,
         timeout=20
     )
 
     response.raise_for_status()
+
     return response.json().get("response", [])
 
 
+def get_events(fixture_id):
+    response = requests.get(
+        f"{API_BASE}/fixtures/events?fixture={fixture_id}",
+        headers=HEADERS,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    return response.json().get("response", [])
+
+
+# =========================
+# CREATION DES PUBLICATIONS
+# =========================
+
 def event_message(match, event):
+
     teams = match["teams"]
+
     home = teams["home"]["name"]
     away = teams["away"]["name"]
 
     player = event.get("player", {}).get("name")
     assist = event.get("assist", {}).get("name")
+
     event_type = event.get("type")
     detail = event.get("detail")
 
     minute = event.get("time", {}).get("elapsed", "?")
 
+    score_home = match.get("goals", {}).get("home")
+    score_away = match.get("goals", {}).get("away")
+
+    score = f"{score_home} - {score_away}"
+
+    # BUT REFUSÉ
     if detail == "Disallowed":
-        return f"❌⚽ BUT REFUSÉ\n\n{home} {minute}' {away}"
+        return (
+            f"❌⚽ BUT REFUSÉ\n\n"
+            f"{home} {score} {away}\n"
+            f"⏱️ {minute}'"
+        )
 
+    # PENALTY MANQUÉ
     if detail == "Missed Penalty":
-        return f"❌⚽ PENALTY MANQUÉ\n\n{home} {minute}' {away}\n👤 {player or 'Joueur'}"
+        return (
+            f"❌⚽ PENALTY MANQUÉ\n\n"
+            f"{home} {score} {away}\n"
+            f"⏱️ {minute}'\n"
+            f"👤 {player or 'Joueur'}"
+        )
 
+    # BUT
     if event_type == "Goal":
+
         if detail == "Own Goal":
             return (
                 f"⚽ BUT CONTRE SON CAMP !\n\n"
-                f"{home} {minute}' {away}\n"
+                f"{home} {score} {away}\n"
+                f"⏱️ {minute}'\n"
                 f"👤 {player or 'Joueur'}"
             )
 
-        text = (
+        message = (
             f"⚽ BUT !\n\n"
-            f"{home} {minute}' {away}\n"
+            f"{home} {score} {away}\n"
+            f"⏱️ {minute}'\n"
             f"👤 {player or 'Joueur'}"
         )
 
         if assist:
-            text += f"\n🎯 Passe décisive : {assist}"
+            message += f"\n🎯 Passe décisive : {assist}"
 
-        return text
+        return message
 
+    # CARTONS
     if event_type == "Card":
+
         if detail == "Yellow Card":
             icon = "🟨"
+            title = "CARTON JAUNE"
+
         elif detail in ["Red Card", "Second Yellow card"]:
             icon = "🟥"
+            title = "CARTON ROUGE"
+
         else:
             return None
 
         return (
-            f"{icon} CARTON !\n\n"
-            f"{home} {minute}' {away}\n"
+            f"{icon} {title}\n\n"
+            f"{home} {score} {away}\n"
+            f"⏱️ {minute}'\n"
             f"👤 {player or 'Joueur'}"
         )
 
+    # REMPLACEMENT
     if event_type == "subst":
+
+        entrant = event.get("assist", {}).get("name")
+        sortant = player
+
         return (
             f"🔄 CHANGEMENT\n\n"
-            f"{home} {minute}' {away}\n"
-            f"⬆️ {event.get('assist', {}).get('name') or 'Entrant'}\n"
-            f"⬇️ {player or 'Sortant'}"
+            f"{home} {score} {away}\n"
+            f"⏱️ {minute}'\n"
+            f"⬆️ {entrant or 'Entrant'}\n"
+            f"⬇️ {sortant or 'Sortant'}"
         )
 
     return None
 
 
-def main():
-    if not API_KEY or not BOT_TOKEN:
-        print("❌ Variables d'environnement manquantes.")
+# =========================
+# SURVEILLANCE
+# =========================
+
+def monitor():
+
+    if not API_KEY:
+        print("❌ API_FOOTBALL_KEY manquante.")
+        return
+
+    if not BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN manquant.")
         return
 
     print("🟢 GOAL PLUS LIVE — BOT DÉMARRÉ")
 
     while True:
+
         try:
+
             matches = get_live_matches()
 
-            print(f"🔎 {len(matches)} matchs en direct analysés.")
+            print(
+                f"🔎 {len(matches)} matchs en direct analysés."
+            )
 
             for match in matches:
-                league = match["league"]
+
+                league = match.get("league", {})
 
                 competition = (
-                    league["name"],
-                    league["country"]
+                    league.get("name"),
+                    league.get("country")
                 )
 
+                # Filtre compétitions
                 if competition not in COMPETITIONS:
                     continue
 
                 fixture_id = match["fixture"]["id"]
-                events_url = (
-                    f"https://v3.football.api-sports.io/"
-                    f"fixtures/events?fixture={fixture_id}"
+
+                print(
+                    f"⚽ Match surveillé : "
+                    f"{match['teams']['home']['name']} "
+                    f"vs "
+                    f"{match['teams']['away']['name']}"
                 )
 
-                response = requests.get(
-                    events_url,
-                    headers=HEADERS,
-                    timeout=20
-                )
-
-                events = response.json().get("response", [])
+                # Récupération des événements
+                events = get_events(fixture_id)
 
                 for event in events:
+
                     event_id = (
                         fixture_id,
                         event.get("time", {}).get("elapsed"),
@@ -177,35 +278,93 @@ def main():
                     if event_id in seen_events:
                         continue
 
-                    message = event_message(match, event)
+                    message = event_message(
+                        match,
+                        event
+                    )
 
                     if message:
-                        if send_telegram(message):
-                            seen_events.add(event_id)
-                            print("📨 Publication :", message)
 
+                        if send_telegram(message):
+
+                            seen_events.add(event_id)
+
+                            print(
+                                "📨 Publication :",
+                                message
+                            )
+
+                # STATUT DU MATCH
                 status = match["fixture"]["status"]["short"]
 
-                status_id = (fixture_id, status)
+                status_id = (
+                    fixture_id,
+                    status
+                )
 
-                if status == "HT" and status_id not in seen_status:
+                home = match["teams"]["home"]["name"]
+                away = match["teams"]["away"]["name"]
+
+                home_score = match["goals"]["home"]
+                away_score = match["goals"]["away"]
+
+                # MI-TEMPS
+                if (
+                    status == "HT"
+                    and status_id not in seen_status
+                ):
+
                     send_telegram(
                         f"⏸️ MI-TEMPS\n\n"
-                        f"{match['teams']['home']['name']} "
-                        f"{match['goals']['home']} - "
-                        f"{match['goals']['away']} "
-                        f"{match['teams']['away']['name']}"
+                        f"{home} {home_score} - "
+                        f"{away_score} {away}"
                     )
+
                     seen_status.add(status_id)
 
-            print("💤 Prochaine vérification dans 15 minutes...")
+                # FIN DU MATCH
+                if (
+                    status in ["FT", "AET", "PEN"]
+                    and status_id not in seen_status
+                ):
+
+                    send_telegram(
+                        f"🏁 FIN DU MATCH\n\n"
+                        f"{home} {home_score} - "
+                        f"{away_score} {away}"
+                    )
+
+                    seen_status.add(status_id)
+
+            print(
+                "💤 Prochaine vérification dans 15 minutes..."
+            )
+
             time.sleep(900)
 
         except Exception as error:
-            print("⚠️ Erreur :", error)
+
+            print(
+                "⚠️ Erreur :",
+                error
+            )
+
             time.sleep(60)
 
 
+# =========================
+# DÉMARRAGE
+# =========================
+
 if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
-    main()
+
+    # Flask démarre immédiatement
+    web_thread = threading.Thread(
+        target=run_web,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    # Bot de surveillance
+    monitor()
